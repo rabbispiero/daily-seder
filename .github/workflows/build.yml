@@ -1,0 +1,85 @@
+name: Build Daily Seder
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # once a week, so GitHub keeps the saved signing key (it drops unused ones after 7 days)
+    - cron: "23 9 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      # The signing key is made once and kept in GitHub's cache, so every new
+      # version installs over the old one, and the website knows the app is its own.
+      - name: Get the saved signing key
+        id: key
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.seder-key
+          key: seder-signing-key-v1
+
+      - name: Make the signing key (first build only)
+        if: steps.key.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.seder-key
+          python3 -c "import secrets;print(secrets.token_urlsafe(24))" > ~/.seder-key/pass
+          keytool -genkeypair -keystore ~/.seder-key/seder.jks -storetype PKCS12 -alias seder \
+            -keyalg RSA -keysize 2048 -validity 10000 -storepass "$(cat ~/.seder-key/pass)" -dname "CN=Daily Seder"
+
+      - name: Save the signing key
+        if: steps.key.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.seder-key
+          key: seder-signing-key-v1
+
+      - name: Use the signing key
+        if: github.event_name != 'schedule'
+        run: |
+          echo "::add-mask::$(cat ~/.seder-key/pass)"
+          echo "SEDER_KEYSTORE=$HOME/.seder-key/seder.jks" >> "$GITHUB_ENV"
+          echo "SEDER_KEYSTORE_PASSWORD=$(cat ~/.seder-key/pass)" >> "$GITHUB_ENV"
+          keytool -list -v -keystore ~/.seder-key/seder.jks -storepass "$(cat ~/.seder-key/pass)" | grep "SHA256:" | awk '{print $2}' > fingerprint.txt
+          echo "Key fingerprint: $(cat fingerprint.txt)"
+
+      - name: Build
+        if: github.event_name != 'schedule'
+        run: gradle --no-daemon assembleRelease
+
+      - name: Name the file
+        if: github.event_name != 'schedule'
+        run: cp app/build/outputs/apk/release/*.apk DailySeder.apk
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'schedule'
+        with:
+          name: DailySeder
+          path: android/DailySeder.apk
+
+      - name: Put it on the Latest release
+        if: github.event_name != 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || gh release create latest --title "Daily Seder (latest build)" --notes "Install DailySeder.apk on your phone."
+          gh release upload latest DailySeder.apk fingerprint.txt --clobber
